@@ -1,7 +1,8 @@
 import torch
-from torch.data.utils import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torch import nn
 from torch.optim import Adam
+import pandas as pd
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -96,3 +97,64 @@ class Forecast(nn.Module):
         x = self.fully_connected(x)
 
         return x
+
+
+class WeatherDataset(Dataset):
+    def __init__(self, weather_files):
+        data = [pd.read_csv(weather_file,
+                            usecols=["LOCAL_YEAR",
+                                     "LOCAL_MONTH",
+                                     "LOCAL_DAY",
+                                     "MEAN_TEMPERATURE",
+                                     "MIN_TEMPERATURE",
+                                     "MAX_TEMPERATURE",
+                                     "TOTAL_PRECIPITATION",
+                                     "TOTAL_RAIN",
+                                     "TOTAL_SNOW"])
+                for weather_file in weather_files]
+
+        years = data.groupby(pd.Grouper(key="LOCAL_YEAR"))
+
+        for year in years:
+            df.sort_values(by=["LOCAL_MONTH", "LOCAL_DAY"], ascending=[True, True], inplace=True)
+
+        self.year_tensors = [self._christmas_tensor(year) if self._valid_year(year) for year in years]
+
+    def _valid_year(self, year):
+        if not ((year["LOCAL_MONTH"] == 1) & (year["LOCAL_DAY"] == 1)).any() or \
+           not ((year["LOCAL_MONTH"] == 12) & (year["LOCAL_DAY"] == 31)).any()
+            return False
+
+        return True
+
+    def _christmas_tensor(self, year):
+        if not self._valid_year(year):
+            return None
+
+        X = self._date_to_tensor(year)
+
+        filtered_day = year.query("LOCAL_MONTH == 12 and LOCAL_DAY == 25").loc(0)
+        is_snowy = float(filtered_day["TOTAL_SNOW"]) > 0
+        y = torch.Tensor([is_snowy, !is_snowy])
+
+        return (X, y)
+
+    def _date_to_tensor(self, year):
+        gen_tensor = lambda x: torch.Tensor(
+            x["MEAN_TEMPERATURE"],
+            x["MIN_TEMPERATURE"],
+            x["MAX_TEMPERATURE"],
+            x["TOTAL_PRECIPITATION"],
+            x["TOTAL_RAIN"],
+            x["TOTAL_SNOW"],
+        )
+
+        year = year[year["LOCAL_MONTH"] != 2 or year["LOCAL_DAY"] != 29]
+
+        return torch.Tensor([gen_tensor(day) for day in year.rows])
+
+    def __len__(self):
+        return len(self.year_tensors)
+
+    def __getitem__(self, idx):
+        return self.year_tensors[idx], self.success_tensors[idx]
