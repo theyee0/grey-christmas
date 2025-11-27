@@ -158,3 +158,64 @@ class WeatherDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.year_tensors[idx], self.success_tensors[idx]
+
+
+class Trainer:
+    def __init__(self, file_list, model):
+        self.device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+        self.model = model
+
+        self.model.to(self.device)
+
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = Adam(model.parameters())
+
+        self.dataset = WeatherDataset(file_list)
+        self.loader = Dataloader(dataset, batch_size=64)
+
+        self.batches = len(loader)
+        self.size = len(loader.dataset)
+
+        self.type = torch.float
+
+    def train():
+        self.model.train()
+
+        size = len(loader)
+
+        for batch, (X, y) in enumerate(self.loader):
+            X, y = X.to(self.type).to(self.device), y.to(self.type).to(self.device)
+
+            prediction = self.model(X)
+            loss = self.criterion(prediction, y)
+
+            loss.backward()
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
+            if batch % 100 == 0:
+                loss, current, size = loss.item(), (batch + 1), self.batches
+                print(f"Loss: {loss.item():>7f} [{current:>5d}/{size:>5d}]\r")
+
+        print()
+
+    def test():
+        self.model.eval()
+
+        test_loss, correct = 0, 0
+
+        with torch.no_grad():
+            for (X, y) in dataloader:
+                X, y = X.to(self.type).to(self.device), y.to(self.type).to(self.device)
+                prediction = self.model(X)
+                loss = self.criterion(prediction, y)
+
+                test_loss += loss.item()
+                correct += (prediction.argmax(1) == y).type(self.type).sum().item()
+        test_loss /= self.batches
+        correct /= self.size
+
+        print(f"Test:\n   Accuracy: {100 * correct:>0.1f}%\n    Loss: {test_loss:>8f}\n")
+
+    def save(filename):
+        torch.save(self.model.state_dict(), filename)
