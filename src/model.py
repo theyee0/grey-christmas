@@ -161,11 +161,9 @@ class WeatherDataset(Dataset):
 
 
 class Trainer:
-    def __init__(self, file_list, model):
+    def __init__(self, file_list):
         self.device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
-        self.model = model
-
-        self.model.to(self.device)
+        self.model = None
 
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = Adam(model.parameters())
@@ -178,7 +176,11 @@ class Trainer:
 
         self.type = torch.float
 
-    def train():
+    def init(self):
+        self.model = ...
+        self.model.to(self.device)
+
+    def train(self):
         self.model.train()
 
         size = len(loader)
@@ -199,7 +201,7 @@ class Trainer:
 
         print()
 
-    def test():
+    def test(self):
         self.model.eval()
 
         test_loss, correct = 0, 0
@@ -217,5 +219,37 @@ class Trainer:
 
         print(f"Test:\n   Accuracy: {100 * correct:>0.1f}%\n    Loss: {test_loss:>8f}\n")
 
-    def save(filename):
+    def save(self, filename):
         torch.save(self.model.state_dict(), filename)
+
+
+class Predictor:
+    def __init__(self):
+        self.device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+        self.type = torch.float
+
+        self.model = None
+
+    def load(self, filename):
+        self.model = torch.load(filename, weights_only=True)
+        self.model.to(device)
+
+    def _date_to_tensor(self, year):
+        gen_tensor = lambda x: torch.Tensor(
+            x["MEAN_TEMPERATURE"],
+            x["MIN_TEMPERATURE"],
+            x["MAX_TEMPERATURE"],
+            x["TOTAL_PRECIPITATION"],
+            x["TOTAL_RAIN"],
+            x["TOTAL_SNOW"],
+        )
+
+        year = year[year["LOCAL_MONTH"] != 2 or year["LOCAL_DAY"] != 29]
+
+        return torch.Tensor([gen_tensor(day) for day in year.rows]).to(device)
+
+    def predict(self, year):
+        return self.predict_tensor(self._date_to_tensor(year)).item()
+
+    def predict_tensor(self, year):
+        return self.model(year)
