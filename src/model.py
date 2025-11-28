@@ -4,11 +4,12 @@ from torch import nn
 from torch.optim import Adam
 import pandas as pd
 
-class Bottleneck(nn.Module):
+
+class BottleNeck(nn.Module):
     expansion = 4
 
-    def __init__(self, in_channels, out_channels, downsample=None stride=1):
-        super(Bottleneck, self).__init__()
+    def __init__(self, in_channels, out_channels, downsample=None, stride=1):
+        super(BottleNeck, self).__init__()
 
         self.convolve0 = nn.Sequential(
             nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=1, padding=0),
@@ -52,7 +53,7 @@ class Forecast(nn.Module):
         self.convolve0 = nn.Conv1d(channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.batch_norm0 = nn.BatchNorm1d(64)
         self.relu = nn.ReLU()
-        self.max_pool = MaxPool1d(kernel_size=3, stride=2, padding=1)
+        self.max_pool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
 
         self.layer0 = self._make_layer(block_sizes[0], channels=64)
         self.layer1 = self._make_layer(block_sizes[1], channels=128, stride=2)
@@ -101,29 +102,46 @@ class Forecast(nn.Module):
 
 class WeatherDataset(Dataset):
     def __init__(self, weather_files):
-        data = [pd.read_csv(weather_file,
-                            usecols=["LOCAL_YEAR",
-                                     "LOCAL_MONTH",
-                                     "LOCAL_DAY",
-                                     "MEAN_TEMPERATURE",
-                                     "MIN_TEMPERATURE",
-                                     "MAX_TEMPERATURE",
-                                     "TOTAL_PRECIPITATION",
-                                     "TOTAL_RAIN",
-                                     "TOTAL_SNOW"])
-                for weather_file in weather_files]
+        self.metacols = [
+            "CLIMATE_IDENTIFIER",
+            "LOCAL_YEAR",
+            "LOCAL_MONTH",
+            "LOCAL_DAY",
+        ]
 
-        years = data.groupby(pd.Grouper(key="LOCAL_YEAR"))
+        self.datacols = [
+            "MEAN_TEMPERATURE",
+#            "MIN_TEMPERATURE",
+#            "MAX_TEMPERATURE",
+#            "TOTAL_PRECIPITATION",
+            "TOTAL_RAIN",
+            "TOTAL_SNOW",
+        ]
+
+        self.cols = self.metacols + self.datacols
+
+        data = pd.concat([pd.read_csv(weather_file, usecols=self.cols)
+                          for weather_file in weather_files])
+
+        years = [x for _, x in data.groupby(by=["CLIMATE_IDENTIFIER", "LOCAL_YEAR"])]
 
         for year in years:
-            df.sort_values(by=["LOCAL_MONTH", "LOCAL_DAY"], ascending=[True, True], inplace=True)
+            year.sort_values(by=["LOCAL_MONTH", "LOCAL_DAY"], ascending=[True, True], inplace=True)
 
-        self.year_tensors = [self._christmas_tensor(year) if self._valid_year(year) for year in years]
+        self.year_tensors = [self._christmas_tensor(year) for year in years if self._valid_year(year)]
 
     def _valid_year(self, year):
-        if not ((year["LOCAL_MONTH"] == 1) & (year["LOCAL_DAY"] == 1)).any() or \
-           not ((year["LOCAL_MONTH"] == 12) & (year["LOCAL_DAY"] == 31)).any()
+        firstday = ((year["LOCAL_MONTH"] == 1) & (year["LOCAL_DAY"] == 1)).any()
+        lastday = ((year["LOCAL_MONTH"] == 12) & (year["LOCAL_DAY"] == 31)).any()
+        if not (firstday or lastday):
             return False
+
+        if len(year) < 365 or len(year) > 366:
+            return False
+
+        for col in self.cols:
+            if year[col].isnull().any():
+                return False
 
         return True
 
@@ -133,57 +151,47 @@ class WeatherDataset(Dataset):
 
         X = self._date_to_tensor(year)
 
-        filtered_day = year.query("LOCAL_MONTH == 12 and LOCAL_DAY == 25").loc(0)
+        filtered_day = year.query("LOCAL_MONTH == 12 and LOCAL_DAY == 25").iloc[0]
         is_snowy = float(filtered_day["TOTAL_SNOW"]) > 0
-        y = torch.Tensor([is_snowy, !is_snowy])
+        y = torch.Tensor([is_snowy])
 
         return (X, y)
 
     def _date_to_tensor(self, year):
-        gen_tensor = lambda x: torch.Tensor(
-            x["MEAN_TEMPERATURE"],
-            x["MIN_TEMPERATURE"],
-            x["MAX_TEMPERATURE"],
-            x["TOTAL_PRECIPITATION"],
-            x["TOTAL_RAIN"],
-            x["TOTAL_SNOW"],
-        )
+        gen_tensor = lambda x: torch.Tensor([x[col] for col in self.datacols])
 
-        year = year[year["LOCAL_MONTH"] != 2 or year["LOCAL_DAY"] != 29]
+        year = year[(year["LOCAL_MONTH"] != 2) | (year["LOCAL_DAY"] != 29)]
 
-        return torch.Tensor([gen_tensor(day) for day in year.rows])
+        return torch.cat(year.apply(gen_tensor, axis=1).values.tolist())
 
     def __len__(self):
         return len(self.year_tensors)
 
     def __getitem__(self, idx):
-        return self.year_tensors[idx], self.success_tensors[idx]
+        return self.year_tensors[idx]
 
 
 class Trainer:
     def __init__(self, file_list):
         self.device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
-        self.model = None
+        self.model = Forecast([3, 3, 9, 2], classes=1, channels=6)
+        self.model.to(self.device)
 
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = Adam(model.parameters())
+        self.optimizer = Adam(self.model.parameters())
 
         self.dataset = WeatherDataset(file_list)
-        self.loader = Dataloader(dataset, batch_size=64)
+        self.loader = DataLoader(self.dataset, batch_size=64)
 
-        self.batches = len(loader)
-        self.size = len(loader.dataset)
+        self.batches = len(self.loader)
+        self.size = len(self.loader.dataset)
 
         self.type = torch.float
-
-    def init(self):
-        self.model = ...
-        self.model.to(self.device)
 
     def train(self):
         self.model.train()
 
-        size = len(loader)
+        size = len(self.loader)
 
         for batch, (X, y) in enumerate(self.loader):
             X, y = X.to(self.type).to(self.device), y.to(self.type).to(self.device)
@@ -224,29 +232,26 @@ class Trainer:
 
 
 class Predictor:
-    def __init__(self):
+    def __init__(self, filename):
         self.device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
         self.type = torch.float
 
-        self.model = None
-
-    def load(self, filename):
         self.model = torch.load(filename, weights_only=True)
         self.model.to(device)
 
     def _date_to_tensor(self, year):
-        gen_tensor = lambda x: torch.Tensor(
+        gen_tensor = lambda x: torch.Tensor([
             x["MEAN_TEMPERATURE"],
             x["MIN_TEMPERATURE"],
             x["MAX_TEMPERATURE"],
             x["TOTAL_PRECIPITATION"],
             x["TOTAL_RAIN"],
             x["TOTAL_SNOW"],
-        )
+        ])
 
-        year = year[year["LOCAL_MONTH"] != 2 or year["LOCAL_DAY"] != 29]
+        year = year[(year["LOCAL_MONTH"] != 2) | (year["LOCAL_DAY"] != 29)]
 
-        return torch.Tensor([gen_tensor(day) for day in year.rows]).to(device)
+        return torch.cat(year.apply(gen_tensor, axis=1)).to(device)
 
     def predict(self, year):
         return self.predict_tensor(self._date_to_tensor(year)).item()
