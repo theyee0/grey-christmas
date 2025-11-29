@@ -1,8 +1,11 @@
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch import nn
 from torch.optim import Adam
+
 import pandas as pd
+
+import numpy as np
 
 
 class BottleNeck(nn.Module):
@@ -28,11 +31,12 @@ class BottleNeck(nn.Module):
             nn.BatchNorm1d(out_channels * self.expansion),
         )
 
+        self.stride = stride
         self.resample = resample
         self.relu = nn.ReLU()
 
     def forward(self, x):
-        initial = x
+        initial = x.clone()
 
         x = self.convolve0(x)
         x = self.convolve1(x)
@@ -64,12 +68,11 @@ class Forecast(nn.Module):
         self.fully_connected = nn.Sequential(
             nn.Linear(512 * BottleNeck.expansion, 512),
             nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, 16),
+            nn.Linear(512, 16),
             nn.ReLU(),
             nn.Linear(16, classes),
         )
+        self.flatten = nn.Flatten()
 
     def _make_layer(self, blocks, channels, stride=1):
         target_channels = channels * BottleNeck.expansion
@@ -102,7 +105,8 @@ class Forecast(nn.Module):
         x = self.layer3(x)
 
         x = self.avgpool(x)
-        x = x.reshape(x.shape[0], -1)
+        x = self.flatten(x)
+
 
         x = self.fully_connected(x)
 
@@ -136,12 +140,11 @@ class WeatherDataset(Dataset):
 
         for year in years:
             year.sort_values(by=["LOCAL_MONTH", "LOCAL_DAY"], ascending=[True, True], inplace=True)
-
         self.year_tensors = [self._christmas_tensor(year) for year in years if self._valid_year(year)]
 
     def _valid_year(self, year):
         firstday = ((year["LOCAL_MONTH"] == 1) & (year["LOCAL_DAY"] == 1)).any()
-        lastday = ((year["LOCAL_MONTH"] == 11) & (year["LOCAL_DAY"] == 31)).any()
+        lastday = ((year["LOCAL_MONTH"] == 12) & (year["LOCAL_DAY"] == 31)).any()
         if not (firstday or lastday):
             return False
 
@@ -161,7 +164,7 @@ class WeatherDataset(Dataset):
         X = self._date_to_tensor(year[year["LOCAL_MONTH"] != 12])
 
         filtered_day = year.query("LOCAL_MONTH == 12 and LOCAL_DAY == 25").iloc[0]
-        is_snowy = float(filtered_day["TOTAL_SNOW"]) > 0
+        is_snowy = float(filtered_day["TOTAL_SNOW"]) > 0.0
         y = torch.Tensor([is_snowy, 1 - is_snowy])
 
         return (X, y)
@@ -188,19 +191,34 @@ class Trainer:
         self.model.to(self.device)
 
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = Adam(self.model.parameters())
+        self.optimizer = Adam(self.model.parameters(), lr=1e-4)
 
         self.train_dataset = WeatherDataset(train_file_list)
-        self.train_loader = DataLoader(self.train_dataset, batch_size=32)
+        self.train_sampler = self._balanced_sampler(self.train_dataset)
+        self.train_loader = DataLoader(
+            self.train_dataset, batch_size=32, sampler=self.train_sampler
+        )
         self.train_batches = len(self.train_loader)
         self.train_size = len(self.train_loader.dataset)
 
         self.test_dataset = WeatherDataset(test_file_list)
-        self.test_loader = DataLoader(self.test_dataset, batch_size=1)
+        self.test_sampler = self._balanced_sampler(self.test_dataset)
+        self.test_loader = DataLoader(
+            self.test_dataset, batch_size=1, sampler=self.test_sampler
+        )
         self.test_batches = len(self.test_loader)
         self.test_size = len(self.test_loader.dataset)
 
         self.type = torch.float
+
+    def _balanced_sampler(self, dataset):
+        labels = [y.argmax() for _, y in dataset]
+        label_counts = np.array([len(np.where(labels == t)[0]) for t in np.unique(labels)])
+        label_weights = 1.0 / label_counts
+
+        sample_weights = torch.from_numpy(np.array([label_weights[l] for l in labels]))
+
+        return WeightedRandomSampler(sample_weights, len(sample_weights))
 
     def train(self, epochs):
         self.model.train()
@@ -210,6 +228,7 @@ class Trainer:
                 X, y = X.to(self.type).to(self.device), y.to(self.type).to(self.device)
 
                 prediction = self.model(X).squeeze()
+                assert prediction.size() == y.size(), "Expected prediction and known values to correspond"
                 loss = self.criterion(prediction, y.squeeze())
 
                 loss.backward()
@@ -234,7 +253,7 @@ class Trainer:
                 prediction = self.model(X)
                 loss = self.criterion(prediction, y)
 
-                if i % 10 == 0:
+                if i % 7 == 0:
                     print(prediction, y)
 
                 test_loss += loss.item()
