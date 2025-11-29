@@ -8,7 +8,7 @@ import pandas as pd
 class BottleNeck(nn.Module):
     expansion = 4
 
-    def __init__(self, in_channels, out_channels, downsample=None, stride=1):
+    def __init__(self, in_channels, out_channels, resample=None, stride=1):
         super(BottleNeck, self).__init__()
 
         self.convolve0 = nn.Sequential(
@@ -25,10 +25,10 @@ class BottleNeck(nn.Module):
 
         self.convolve2 = nn.Sequential(
             nn.Conv1d(out_channels, out_channels * self.expansion, kernel_size=1, stride=1, padding=0),
-            nn.BatchNorm1d(out_channels),
+            nn.BatchNorm1d(out_channels * self.expansion),
         )
 
-        self.downsample = downsample
+        self.resample = resample
         self.relu = nn.ReLU()
 
     def forward(self, x):
@@ -38,8 +38,8 @@ class BottleNeck(nn.Module):
         x = self.convolve1(x)
         x = self.convolve2(x)
 
-        if self.downsample:
-            x = self.downsample(x)
+        if self.resample is not None:
+            initial = self.resample(initial)
 
         return self.relu(initial + x)
 
@@ -61,20 +61,29 @@ class Forecast(nn.Module):
         self.layer3 = self._make_layer(block_sizes[3], channels=512, stride=2)
 
         self.avgpool = nn.AdaptiveAvgPool1d(1)
-        self.fully_connected = nn.Linear(512 * BottleNeck.expansion, classes)
+        self.fully_connected = nn.Sequential(
+            nn.Linear(512 * BottleNeck.expansion, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 16),
+            nn.ReLU(),
+            nn.Linear(16, classes),
+        )
 
     def _make_layer(self, blocks, channels, stride=1):
         target_channels = channels * BottleNeck.expansion
 
-        downsampler = None
+        resample = None
 
         if stride != 1 or self.in_channels != target_channels:
-            downsampler = nn.Sequential(
+            resample = nn.Sequential(
                 nn.Conv1d(self.in_channels, target_channels, kernel_size=1, stride=stride),
                 nn.BatchNorm1d(target_channels)
             )
 
-        layers = [BottleNeck(self.in_channels, channels, downsample=downsampler, stride=stride)]
+        layers = [BottleNeck(self.in_channels, channels, resample=resample, stride=stride)]
+        self.in_channels = target_channels
 
         for i in range(blocks - 1):
             layers.append(BottleNeck(self.in_channels, channels))
@@ -87,10 +96,10 @@ class Forecast(nn.Module):
         x = self.relu(x)
         x = self.max_pool(x)
 
+        x = self.layer0(x)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
-        x = self.layer4(x)
 
         x = self.avgpool(x)
         x = x.reshape(x.shape[0], -1)
@@ -111,9 +120,9 @@ class WeatherDataset(Dataset):
 
         self.datacols = [
             "MEAN_TEMPERATURE",
-#            "MIN_TEMPERATURE",
-#            "MAX_TEMPERATURE",
-#            "TOTAL_PRECIPITATION",
+            "MIN_TEMPERATURE",
+            "MAX_TEMPERATURE",
+            "TOTAL_PRECIPITATION",
             "TOTAL_RAIN",
             "TOTAL_SNOW",
         ]
@@ -132,7 +141,7 @@ class WeatherDataset(Dataset):
 
     def _valid_year(self, year):
         firstday = ((year["LOCAL_MONTH"] == 1) & (year["LOCAL_DAY"] == 1)).any()
-        lastday = ((year["LOCAL_MONTH"] == 12) & (year["LOCAL_DAY"] == 31)).any()
+        lastday = ((year["LOCAL_MONTH"] == 11) & (year["LOCAL_DAY"] == 31)).any()
         if not (firstday or lastday):
             return False
 
@@ -149,11 +158,11 @@ class WeatherDataset(Dataset):
         if not self._valid_year(year):
             return None
 
-        X = self._date_to_tensor(year)
+        X = self._date_to_tensor(year[year["LOCAL_MONTH"] != 12])
 
         filtered_day = year.query("LOCAL_MONTH == 12 and LOCAL_DAY == 25").iloc[0]
         is_snowy = float(filtered_day["TOTAL_SNOW"]) > 0
-        y = torch.Tensor([is_snowy])
+        y = torch.Tensor([is_snowy, 1 - is_snowy])
 
         return (X, y)
 
@@ -161,8 +170,9 @@ class WeatherDataset(Dataset):
         gen_tensor = lambda x: torch.Tensor([x[col] for col in self.datacols])
 
         year = year[(year["LOCAL_MONTH"] != 2) | (year["LOCAL_DAY"] != 29)]
+        tensor_list = year.apply(gen_tensor, axis=1).values.tolist()
 
-        return torch.cat(year.apply(gen_tensor, axis=1).values.tolist())
+        return torch.stack(tensor_list, dim=1)
 
     def __len__(self):
         return len(self.year_tensors)
@@ -172,42 +182,46 @@ class WeatherDataset(Dataset):
 
 
 class Trainer:
-    def __init__(self, file_list):
+    def __init__(self, train_file_list, test_file_list):
         self.device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
-        self.model = Forecast([3, 3, 9, 2], classes=1, channels=6)
+        self.model = Forecast([20, 20, 20, 20], classes=2, channels=6)
         self.model.to(self.device)
 
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = Adam(self.model.parameters())
 
-        self.dataset = WeatherDataset(file_list)
-        self.loader = DataLoader(self.dataset, batch_size=64)
+        self.train_dataset = WeatherDataset(train_file_list)
+        self.train_loader = DataLoader(self.train_dataset, batch_size=32)
+        self.train_batches = len(self.train_loader)
+        self.train_size = len(self.train_loader.dataset)
 
-        self.batches = len(self.loader)
-        self.size = len(self.loader.dataset)
+        self.test_dataset = WeatherDataset(test_file_list)
+        self.test_loader = DataLoader(self.test_dataset, batch_size=1)
+        self.test_batches = len(self.test_loader)
+        self.test_size = len(self.test_loader.dataset)
 
         self.type = torch.float
 
-    def train(self):
+    def train(self, epochs):
         self.model.train()
 
-        size = len(self.loader)
+        for epoch in range(epochs):
+            for batch, (X, y) in enumerate(self.train_loader):
+                X, y = X.to(self.type).to(self.device), y.to(self.type).to(self.device)
 
-        for batch, (X, y) in enumerate(self.loader):
-            X, y = X.to(self.type).to(self.device), y.to(self.type).to(self.device)
+                prediction = self.model(X).squeeze()
+                loss = self.criterion(prediction, y.squeeze())
 
-            prediction = self.model(X)
-            loss = self.criterion(prediction, y)
+                loss.backward()
+                self.optimizer.step()
+                self.optimizer.zero_grad()
 
-            loss.backward()
-            self.optimizer.step()
-            self.optimizer.zero_grad()
+                if batch % 1 == 0:
+                    loss, current, size = loss.item(), (batch + 1), self.train_batches
+                    print(f"Loss: {loss:>7f} [{current:>5d}/{size:>5d}]\r", end="")
 
-            if batch % 100 == 0:
-                loss, current, size = loss.item(), (batch + 1), self.batches
-                print(f"Loss: {loss.item():>7f} [{current:>5d}/{size:>5d}]\r")
-
-        print()
+            print()
+            self.test()
 
     def test(self):
         self.model.eval()
@@ -215,17 +229,21 @@ class Trainer:
         test_loss, correct = 0, 0
 
         with torch.no_grad():
-            for (X, y) in dataloader:
+            for i, (X, y) in enumerate(self.test_loader):
                 X, y = X.to(self.type).to(self.device), y.to(self.type).to(self.device)
                 prediction = self.model(X)
                 loss = self.criterion(prediction, y)
 
+                if i % 10 == 0:
+                    print(prediction, y)
+
                 test_loss += loss.item()
                 correct += (prediction.argmax(1) == y).type(self.type).sum().item()
-        test_loss /= self.batches
-        correct /= self.size
 
-        print(f"Test:\n   Accuracy: {100 * correct:>0.1f}%\n    Loss: {test_loss:>8f}\n")
+        test_loss /= self.test_batches
+        correct /= self.test_size
+
+        print(f"Test:\n    Accuracy: {100 * correct:>0.1f}%\n    Loss: {test_loss:>8f}\n")
 
     def save(self, filename):
         torch.save(self.model.state_dict(), filename)
