@@ -91,8 +91,6 @@ class Forecast(nn.Module):
         for i in range(blocks - 1):
             layers.append(BottleNeck(self.in_channels, channels))
 
-        print(layers)
-        
         return nn.Sequential(*layers)
 
     def forward(self, x):
@@ -224,6 +222,7 @@ class Trainer:
 
     def train(self, epochs):
         for epoch in range(epochs):
+            print(f"Training epoch {epoch + 1}:")
             self.model.train()
             for batch, (X, y) in enumerate(self.train_loader):
                 X, y = X.to(self.type).to(self.device), y.to(self.type).to(self.device)
@@ -254,9 +253,6 @@ class Trainer:
                 prediction = self.model(X)
                 loss = self.criterion(prediction, y)
 
-                if i % 7 == 0:
-                    print(prediction, y)
-
                 test_loss += loss.item()
                 correct += (prediction.argmax(1) == y.argmax(1)).sum().item()
 
@@ -274,25 +270,35 @@ class Predictor:
         self.device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
         self.type = torch.bfloat16
 
-        self.model = torch.load(filename, weights_only=True)
-        self.model.to(device).to(self.type)
+        self.model = Forecast([1, 3, 5, 1], classes=2, channels=6)
+        self.model.to(self.device).to(self.type)
+
+        self.model.load_state_dict(torch.load(filename, weights_only=True))
+
+        self.datacols = [
+            "MEAN_TEMPERATURE",
+            "MIN_TEMPERATURE",
+            "MAX_TEMPERATURE",
+            "TOTAL_PRECIPITATION",
+            "TOTAL_RAIN",
+            "TOTAL_SNOW",
+        ]
 
     def _date_to_tensor(self, year):
-        gen_tensor = lambda x: torch.Tensor([
-            x["MEAN_TEMPERATURE"],
-            x["MIN_TEMPERATURE"],
-            x["MAX_TEMPERATURE"],
-            x["TOTAL_PRECIPITATION"],
-            x["TOTAL_RAIN"],
-            x["TOTAL_SNOW"],
-        ])
+        gen_tensor = lambda x: torch.Tensor([x[col] for col in self.datacols])
 
         year = year[(year["LOCAL_MONTH"] != 2) | (year["LOCAL_DAY"] != 29)]
+        tensor_list = year.apply(gen_tensor, axis=1).values.tolist()
 
-        return torch.cat(year.apply(gen_tensor, axis=1)).to(device)
+        return torch.stack(tensor_list, dim=1)
 
     def predict(self, year):
         return self.predict_tensor(self._date_to_tensor(year)).item()
 
     def predict_tensor(self, year):
-        return self.model(year)
+        self.model.eval()
+
+        year = year.unsqueeze(0)
+
+        with torch.no_grad():
+            return self.model(year.to(self.type).to(self.device))
