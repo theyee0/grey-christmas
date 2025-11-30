@@ -16,24 +16,24 @@ class BottleNeck(nn.Module):
 
         self.convolve0 = nn.Sequential(
             nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=1, padding=0),
-            nn.BatchNorm1d(out_channels),
+            nn.BatchNorm1d(out_channels, momentum=0.5),
             nn.ReLU()
         )
 
         self.convolve1 = nn.Sequential(
             nn.Conv1d(out_channels, out_channels, kernel_size=3, stride=stride, padding=1),
-            nn.BatchNorm1d(out_channels),
+            nn.BatchNorm1d(out_channels, momentum=0.5),
             nn.ReLU()
         )
 
         self.convolve2 = nn.Sequential(
             nn.Conv1d(out_channels, out_channels * self.expansion, kernel_size=1, stride=1, padding=0),
-            nn.BatchNorm1d(out_channels * self.expansion),
+            nn.BatchNorm1d(out_channels * self.expansion, momentum=0.5),
         )
 
         self.stride = stride
         self.resample = resample
-        self.relu = nn.ReLU()
+        self.relu = nn.ELU()
 
     def forward(self, x):
         initial = x.clone()
@@ -67,9 +67,9 @@ class Forecast(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         self.fully_connected = nn.Sequential(
             nn.Linear(512 * BottleNeck.expansion, 512),
-            nn.ReLU(),
+            nn.ELU(),
             nn.Linear(512, 16),
-            nn.ReLU(),
+            nn.ELU(),
             nn.Linear(16, classes),
         )
         self.flatten = nn.Flatten()
@@ -82,7 +82,7 @@ class Forecast(nn.Module):
         if stride != 1 or self.in_channels != target_channels:
             resample = nn.Sequential(
                 nn.Conv1d(self.in_channels, target_channels, kernel_size=1, stride=stride),
-                nn.BatchNorm1d(target_channels)
+                nn.BatchNorm1d(target_channels, momentum=0.5)
             )
 
         layers = [BottleNeck(self.in_channels, channels, resample=resample, stride=stride)]
@@ -90,6 +90,8 @@ class Forecast(nn.Module):
 
         for i in range(blocks - 1):
             layers.append(BottleNeck(self.in_channels, channels))
+
+        print(layers)
         
         return nn.Sequential(*layers)
 
@@ -106,7 +108,6 @@ class Forecast(nn.Module):
 
         x = self.avgpool(x)
         x = self.flatten(x)
-
 
         x = self.fully_connected(x)
 
@@ -187,8 +188,11 @@ class WeatherDataset(Dataset):
 class Trainer:
     def __init__(self, train_file_list, test_file_list):
         self.device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
-        self.model = Forecast([20, 20, 20, 20], classes=2, channels=6)
-        self.model.to(self.device)
+
+        self.type = torch.bfloat16
+
+        self.model = Forecast([1, 3, 5, 1], classes=2, channels=6)
+        self.model.to(self.device).to(self.type)
 
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = Adam(self.model.parameters(), lr=1e-4)
@@ -209,8 +213,6 @@ class Trainer:
         self.test_batches = len(self.test_loader)
         self.test_size = len(self.test_loader.dataset)
 
-        self.type = torch.float
-
     def _balanced_sampler(self, dataset):
         labels = [y.argmax() for _, y in dataset]
         label_counts = np.array([len(np.where(labels == t)[0]) for t in np.unique(labels)])
@@ -221,15 +223,14 @@ class Trainer:
         return WeightedRandomSampler(sample_weights, len(sample_weights))
 
     def train(self, epochs):
-        self.model.train()
-
         for epoch in range(epochs):
+            self.model.train()
             for batch, (X, y) in enumerate(self.train_loader):
                 X, y = X.to(self.type).to(self.device), y.to(self.type).to(self.device)
 
-                prediction = self.model(X).squeeze()
+                prediction = self.model(X)
                 assert prediction.size() == y.size(), "Expected prediction and known values to correspond"
-                loss = self.criterion(prediction, y.squeeze())
+                loss = self.criterion(prediction, y)
 
                 loss.backward()
                 self.optimizer.step()
@@ -257,7 +258,7 @@ class Trainer:
                     print(prediction, y)
 
                 test_loss += loss.item()
-                correct += (prediction.argmax(1) == y).type(self.type).sum().item()
+                correct += (prediction.argmax(1) == y.argmax(1)).sum().item()
 
         test_loss /= self.test_batches
         correct /= self.test_size
@@ -271,10 +272,10 @@ class Trainer:
 class Predictor:
     def __init__(self, filename):
         self.device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
-        self.type = torch.float
+        self.type = torch.bfloat16
 
         self.model = torch.load(filename, weights_only=True)
-        self.model.to(device)
+        self.model.to(device).to(self.type)
 
     def _date_to_tensor(self, year):
         gen_tensor = lambda x: torch.Tensor([
