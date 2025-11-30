@@ -6,7 +6,9 @@ A machine learning program that attempts to predict whether a given year will ha
 
 This demo shows the model being trained on 131 years of data from the Vancouver region. The test dataset used is the same dataset to demonstrate the model's ability to converge, or at least memorize data.
 
-Video coming soon...
+
+https://github.com/user-attachments/assets/aa2407fa-c40a-4897-8cd3-e3179d2794bd
+
 
 # Usage
 
